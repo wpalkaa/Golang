@@ -9,9 +9,7 @@ const simulations int = 10000
 
 func sym31(change bool) int {
 	// N - pudeł
-	// k - otwartych pudeł przez prowadzącego
 	var N int = 3
-	var k int = 1
 	var won int = 0
 
 	for i := 0; i < simulations; i++ {
@@ -21,12 +19,7 @@ func sym31(change bool) int {
 		// Gdy zmienia
 		if change {
 			if choice != prize {
-				newBoxes := N - k - 1
-				var newChoice = rand.Intn(newBoxes)
-
-				if newChoice == 0 {
-					won++
-				}
+				won++
 			}
 		} else { // Nie zmienia
 			if choice == prize {
