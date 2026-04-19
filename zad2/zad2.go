@@ -183,7 +183,7 @@ func main() {
 	p2 = assingScore(p2, "Bach", []int{17, 12, 0, 18, 16})
 	p2 = assingScore(p2, "Mozart", []int{18, 16, 0, 18, 17})
 	p2 = assingRepertoire(rep2, p2, stage_II)
-	p1 = assingScore(p2, "Mozartini", []int{12, 12, 0, 13, 25})
+	p2 = assingScore(p2, "Mozartini", []int{12, 12, 0, 13, 25})
 
 	p3 := participant{name: "Babels"}
 	p3 = assingRepertoire(rep, p3, stage_I)
@@ -191,7 +191,7 @@ func main() {
 	p3 = assingScore(p3, "Bach", []int{21, 3, 7, 0, 15})
 	p3 = assingScore(p3, "Mozart", []int{14, 10, 12, 0, 13})
 	p3 = assingRepertoire(rep2, p3, stage_II)
-	p1 = assingScore(p3, "Mozartini", []int{24, 25, 25, 0, 25})
+	p3 = assingScore(p3, "Mozartini", []int{24, 25, 25, 0, 25})
 
 	participantList := []participant{p1, p2, p3}
 
