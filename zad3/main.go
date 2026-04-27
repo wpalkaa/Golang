@@ -76,7 +76,19 @@ type Schedule struct {
 	Flights []*Flight
 }
 
-func (s *Schedule) FindPassengerReservations(p *Passenger) []*Reservation {
+// ===============
+
+type SearchFlights interface {
+	ByDeparture(port string) []*Flight
+	ByDestination(port string) []*Flight
+}
+type SearchReservation interface {
+	ByPassenger(p *Passenger) []*Reservation
+}
+
+// ==============
+
+func (s *Schedule) ByPassenger(p *Passenger) []*Reservation {
 	var passengerReservations []*Reservation
 	for _, f := range s.Flights {
 		for _, r := range f.Reservations {
@@ -110,6 +122,47 @@ func (s *Schedule) ByDestination(p string) []*Flight {
 	})
 }
 
+// ===========
+
+// func (s *Schedule) FindPassengerReservations(p *Passenger) []*Reservation {
+// 	var passengerReservations []*Reservation
+// 	for _, f := range s.Flights {
+// 		for _, r := range f.Reservations {
+// 			if r.Passenger.ID == p.ID {
+// 				passengerReservations = append(passengerReservations, r)
+// 			}
+// 		}
+// 	}
+// 	return passengerReservations
+// }
+
+func PrintPassengerReservations(s SearchReservation, p *Passenger) {
+	passengerReservations := s.ByPassenger(p)
+	fmt.Printf("Rezerwacje pasażera %d:\n", p.ID)
+
+	for _, r := range passengerReservations {
+		fmt.Printf("  - %s\n", r.Flight)
+	}
+}
+
+func PrintFlightsByDestination(s SearchFlights, p string) {
+	flights := s.ByDestination(p)
+	fmt.Printf("Lista lotów lecących do %s:\n", p)
+
+	for _, f := range flights {
+		fmt.Printf("  - %s\n", f)
+	}
+}
+
+func PrintFlightsByDeparture(s SearchFlights, p string) {
+	flights := s.ByDeparture(p)
+	fmt.Printf("Lista lotów lecących z %s:\n", p)
+
+	for _, f := range flights {
+		fmt.Printf("  - %s\n", f)
+	}
+}
+
 // func (s *Schedule) ByDestination(p string) []*Flight {
 // 	var flightsList []*Flight
 // 	for _, f := range s.Flights {
@@ -119,18 +172,6 @@ func (s *Schedule) ByDestination(p string) []*Flight {
 // 	}
 // 	return flightsList
 // }
-
-// ===============
-
-type SearchFlights interface {
-	ByDeparture(port string) []*Flight
-	ByDestination(port string) []*Flight
-}
-type SearchReservation interface {
-	ByPassenger(p *Passenger) []*Reservation
-}
-
-// ============
 
 func main() {
 	p1 := &Plane{
@@ -205,21 +246,29 @@ func main() {
 	fmt.Printf("  - f2-%d\n", f2.CheckCapacity())
 	fmt.Printf("  - f3-%d\n", f3.CheckCapacity())
 
+	// fmt.Println("============ Find By ============")
+	// l := sch.ByDeparture("Warszawa")
+	// fmt.Println("  - ByDeparture=Warszawa: ", l)
+
+	// l = sch.ByDestination("Niujork")
+	// fmt.Println("  - ByDestination=Niujork: ", l)
+
+	// l = sch.ByDestination("Brak")
+	// fmt.Println("  - ByDestination=Brak: ", l)
+
+	// fmt.Println("============ Rezerwacje danego pasażera ============")
+	// rl := sch.FindPassengerReservations(ps1)
+
+	// fmt.Println("  - Dla ps1:")
+	// for _, r := range rl {
+	// 	fmt.Println("    - ", r)
+	// }
+
 	fmt.Println("============ Find By ============")
-	l := sch.ByDeparture("Warszawa")
-	fmt.Println("  - ByDeparture=Warszawa: ", l)
-
-	l = sch.ByDestination("Niujork")
-	fmt.Println("  - ByDestination=Niujork: ", l)
-
-	l = sch.ByDestination("Brak")
-	fmt.Println("  - ByDestination=Brak: ", l)
-
+	PrintFlightsByDeparture(&sch, "Warszawa")
+	PrintFlightsByDestination(&sch, "Niujork")
+	PrintFlightsByDestination(&sch, "Brak")
 	fmt.Println("============ Rezerwacje danego pasażera ============")
-	rl := sch.FindPassengerReservations(ps1)
+	PrintPassengerReservations(&sch, ps1)
 
-	fmt.Println("  - Dla ps1:")
-	for _, r := range rl {
-		fmt.Println("    - ", r)
-	}
 }
