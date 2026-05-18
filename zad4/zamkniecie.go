@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"sync"
@@ -15,22 +16,27 @@ const GridStep = 100 * time.Millisecond       // 1 godzina czasu
 const WeatherPerGrid = GridStep / WeatherStep // = 12 kroków po
 const ForecastHorizon = 5                     // prognoza na 5 kroków GridStep
 const PredictorBufferSize = WeatherPerGrid    // bufor = 1 godzin
+const WindMax = 40.0
+const SunMax = 100
+const WINDPOWER = 3.0
+const SUNPOWER = 2.0
 
 type WeatherData struct {
-	Wind float64
-	Sun  float64
+	WindSpeed    float64
+	SunIntensity float64
 }
 
 type ForecastData struct {
-	n               int
-	predictedPower  float64
-	predictedChange float64
+	// n               int
+	predictedPower float64
+	// predictedChange float64
 }
 
 type DemandReport struct {
 	Id       string
 	Demand   float64
 	Priority int
+	RespChan chan SupplyStatus
 }
 
 type SupplyStatus struct {
@@ -70,7 +76,7 @@ type WeatherProvider interface {
 // ============ Logger ============
 
 type Logger struct {
-	logChan chan string
+	logChan <-chan string
 }
 
 // implementacja loggera
@@ -80,14 +86,47 @@ func CreateLogger() {}
 // Log(mess string)
 // Flush()
 
+// ============ Broadcaster ============
+
+type Broadcaster struct {
+	subcribers []chan<- WeatherData
+	mutex      sync.Mutex
+}
+
+func (b *Broadcaster) Subscribe() chan WeatherData {
+	ch := make(chan WeatherData)
+
+	b.mutex.Lock()
+	b.subcribers = append(b.subcribers, ch)
+	b.mutex.Unlock()
+
+	return ch
+}
+
+func (b *Broadcaster) Send(data WeatherData) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	for _, ch := range b.subcribers {
+		select {
+		case ch <- data:
+		default:
+		}
+	}
+}
+
 // ============ WeatherStation ============
 
 type WeatherStation struct {
-	broadcaster chan<- WeatherData
+	windSpeed float64
+	sun       float64
 }
 
-// funkcja generująca dane pogodowe, wysyłane one są do broadcastera
-func (w *WeatherStation) Run(ctx context.Context, wg *sync.WaitGroup) {
+func NewWeatherStation() *WeatherStation {
+	return &WeatherStation{}
+}
+
+func (ws *WeatherStation) Run(ctx context.Context, wg *sync.WaitGroup, broadcast *Broadcaster) {
 	defer wg.Done()
 	ticker := time.NewTicker(WeatherStep)
 	defer ticker.Stop()
@@ -98,42 +137,25 @@ func (w *WeatherStation) Run(ctx context.Context, wg *sync.WaitGroup) {
 			return
 
 		case <-ticker.C:
-			// Wylicz to i tamto, wyślij na kanał
-			w.broadcaster <- WeatherData{ /*...*/ }
+			ws.windSpeed += rand.Float64()*2 - 1
+			ws.sun += rand.Float64()*10 - 10
+
+			if ws.windSpeed < 0.0 {
+				ws.windSpeed = 0.0
+			}
+			if ws.windSpeed > WindMax {
+				ws.windSpeed = 40.0
+			}
+			if ws.sun < 0 {
+				ws.sun = 0
+			}
+			if ws.sun > SunMax {
+				ws.sun = 100
+			}
+
+			broadcast.Send(WeatherData{WindSpeed: ws.windSpeed, SunIntensity: ws.sun})
 		}
 	}
-}
-
-// ============ Broadcaster ============
-
-type Broadcaster struct {
-	subcribers []chan<- WeatherData
-	m          sync.Mutex
-}
-
-func (b *Broadcaster) fun(ctx context.Context, wg *sync.WaitGroup, ch <-chan WeatherData) {
-	defer wg.Done()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-
-		case data := <-ch:
-			//przyjmuje dane, rozgłoś z użyciem instrukcji select z klauzulą default,
-			// porzuca paczkę dla danego subskrybenta, jeśli ten jest zajęty i nie odbiera —
-			// dzięki temu wolny subskrybent nie blokuje całej sieci
-		}
-	}
-	/*
-		// Szkielet logiki Broadcastera
-		for _, ch := range subscribers {
-		 select {
-		 case ch <- weatherData:
-		 default:
-		 // subskrybent zajęty — porzucamy paczkę dla niego
-		 }
-		}
-	*/
 }
 
 // ============ Predictor ============
@@ -159,43 +181,247 @@ func (p *WeatherPredictor) Run(ctx context.Context, wg *sync.WaitGroup, weatherD
 			}
 
 		case <-gridTicker.C:
-			// Licz ForecastReport i wyślij do gridHub
+			first := p.buffer[0]
+			last := p.buffer[len(p.buffer)-1]
+
+			trendWind := last.WindSpeed - first.WindSpeed
+			trendSun := last.SunIntensity - first.SunIntensity
+
+			predictedPower := (trendWind / WindMax * WINDPOWER) + (float64(trendSun)/SunMax)*SUNPOWER
+
+			select {
+			case forecastChan <- ForecastData{predictedPower: predictedPower}:
+			default:
+			}
 		}
 	}
 }
 
-// ============ Konsumenci ============
-
-type ConsumerType string
-
-const (
-	Residental ConsumerType = "residental"
-	Industrial ConsumerType = "industrial"
-	Critical   ConsumerType = "critical"
-)
-
-type Consumer struct {
-	Id       int
-	Type     ConsumerType
-	Priority int
+// ============ OZE ============
+type OZE struct {
+	output   float64
+	mu       sync.Mutex
+	capacity float64
+	limit    float64
 }
 
-func (c *Consumer) fun(ctx context.Context, wg *sync.WaitGroup, demandChan chan<- DemandReport, respChan <-chan SupplyStatus, c Consumer) {
+func (o *OZE) SetLimit(limit float64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if limit <= 0.0 {
+		o.limit = 1.0
+	}
+	if limit > 100.0 {
+		o.limit = 100.0
+	}
+}
+
+func (o *OZE) GetPower() float64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.output
+}
+
+func (o *OZE) Run(ctx context.Context, wg *sync.WaitGroup, weatherChan <-chan WeatherData) {
 	defer wg.Done()
-	ticker := ticker.NewTimer(GridStep)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case data := <-weatherChan:
+			o.mu.Lock()
+			o.output = (o.capacity + (data.WindSpeed/WindMax)*WINDPOWER + (data.SunIntensity/SunMax)*SUNPOWER) * o.limit
+			o.mu.Unlock()
+		}
+	}
+}
+
+// ============ CoalPlant ============
+type PlantState int
+
+const (
+	PlantOff PlantState = iota
+	PlantWarmingUp
+	PlantOn
+)
+
+type CoalPlant struct {
+	mu          sync.Mutex
+	output      float64
+	state       PlantState
+	warmingTime int
+}
+
+func (cp *CoalPlant) Run() {
+	cp.mu.Lock()
+	if cp.state != PlantOff {
+		cp.mu.Unlock()
+		return
+	}
+
+	cp.state = PlantWarmingUp
+	cp.mu.Unlock()
+
+	go func() {
+		time.Sleep(GridStep * time.Duration(cp.warmingTime))
+
+		cp.mu.Lock()
+		cp.state = PlantOn
+		cp.output = 200.0
+		cp.mu.Unlock()
+	}()
+}
+
+func (cp *CoalPlant) GetPower() float64 {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	if cp.state == PlantOn {
+		return cp.output
+	}
+	return 0
+}
+
+// ============ Konsumenci ============
+
+// ---- residental
+type ResidentalConsumer struct {
+	id         string
+	baseDemand float64
+}
+
+func (r *ResidentalConsumer) GetPriority() int { return 3 }
+func (r *ResidentalConsumer) GetID() string    { return r.id }
+
+func (r *ResidentalConsumer) calcDemand(hour int) float64 {
+	if (hour >= 7 && hour <= 9) || (hour >= 18 && hour <= 22) {
+		return r.baseDemand * 2
+	}
+	return r.baseDemand
+}
+
+func (r *ResidentalConsumer) Run(ctx context.Context, wg *sync.WaitGroup, demandChan chan<- DemandReport) {
+	defer wg.Done()
+	ticker := time.NewTicker(GridStep)
 	defer ticker.Stop()
+	respChan := make(chan SupplyStatus, 1)
+
+	step := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			step++
+			hour := step % 24
+			demand := r.calcDemand(hour)
+
+			report := DemandReport{
+				Id:       r.id,
+				Demand:   demand,
+				Priority: r.GetPriority(),
+				RespChan: respChan,
+			}
+
+			demandChan <- report
+
+			select {
+			case <-respChan:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// ------Industrial
+type IndustrialConsumer struct {
+	id         string
+	baseDemand float64
+}
+
+func (r *IndustrialConsumer) GetPriority() int { return 2 }
+func (r *IndustrialConsumer) GetID() string    { return r.id }
+
+func (r *IndustrialConsumer) calcDemand(hour int) float64 {
+	if hour >= 6 && hour <= 18 {
+		demand := r.baseDemand * 3
+		if rand.Float64() < 0.1 {
+			demand += 50
+		}
+		return demand
+	}
+	return r.baseDemand
+}
+
+func (r *IndustrialConsumer) Run(ctx context.Context, wg *sync.WaitGroup, demandChan chan<- DemandReport) {
+	defer wg.Done()
+	ticker := time.NewTicker(GridStep)
+	defer ticker.Stop()
+	respChan := make(chan SupplyStatus, 1)
+
+	step := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			step++
+			hour := step % 24
+			demand := r.calcDemand(hour)
+
+			report := DemandReport{
+				Id:       r.id,
+				Demand:   demand,
+				Priority: r.GetPriority(),
+				RespChan: respChan,
+			}
+
+			demandChan <- report
+
+			select {
+			case <-respChan:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// ------Critical
+type CriticalConsumer struct {
+	id         string
+	baseDemand float64
+}
+
+func (r *CriticalConsumer) GetPriority() int { return 1 }
+func (r *CriticalConsumer) GetID() string    { return r.id }
+
+func (r *CriticalConsumer) Run(ctx context.Context, wg *sync.WaitGroup, demandChan chan<- DemandReport) {
+	defer wg.Done()
+	ticker := time.NewTicker(GridStep)
+	defer ticker.Stop()
+	respChan := make(chan SupplyStatus, 1)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-
 		case <-ticker.C:
-			// 1. Oblicz aktualne zapotrzebowanie P_demand (na podstawie czasu symu
-			// 2. Wyślij DemandReport{ID, P_demand, Priority} do GridHub przez wspó
-			// 3. Czekaj na SupplyStatus z kanału zwrotnego
-			// 4. Jeśli SupplyStatus.AllocatedMW < P_demand → przejdź w stan Partia
-			// 5. Zgłoś zdarzenie do modułu statystyk
+
+			report := DemandReport{
+				Id:       r.id,
+				Demand:   r.baseDemand,
+				Priority: r.GetPriority(),
+				RespChan: respChan,
+			}
+
+			demandChan <- report
+
+			select {
+			case <-respChan:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }
@@ -221,19 +447,22 @@ func (ess *ESS) GetSoC() float64 {
 // ============ GridHub ============
 
 type GridHub struct {
+	oze          *OZE
+	coalPlant    *CoalPlant
+	ess          *ESS
 	forecastChan <-chan ForecastData
 	demandChan   <-chan DemandReport
-	consumers    []Consumer
-	logger       Datalogger
+	demands      map[string]DemandReport
+	// logChan chan<- Logger
 }
 
-func (gh *GridHub) fun(ctx context.Context, wg *sync.WaitGroup) {
+func (gh *GridHub) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	ticker := time.NewTicker(GridStep)
 	defer ticker.Stop()
 
 	demandsMap := map[string]DemandReport{}
-
+	step := 0
 	// bilans = łączna_produkcja + ESS.Discharge() < łączny_popyt,
 
 	for {
@@ -281,6 +510,10 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
+	demandChat := make(chan DemandReport, 50)
+	forecastChan := make(chan ForecastData, 1)
+	loggerChan := make(chan DataLogger, 100)
+
 	// 3. Gorutyna czekająca na Ctrl+C
 	go func() {
 		<-sigChan
@@ -291,6 +524,7 @@ func main() {
 	var wg sync.WaitGroup
 
 	// Uruchamianie komponentów
+	// go weatherStation.Run(ctx, &wg, broadcaser)
 
 	// ... reszta komponentów ...
 
@@ -298,3 +532,6 @@ func main() {
 	wg.Wait()
 	fmt.Println("[SYSTEM] Wszystkie komponenty zamknięte. Koniec.")
 }
+
+// Każdy konsumer ma swoją strukturę
+// GridHub - synchronizacja => 3 odbiorców wysyła demand i dopiero przelicza gridhub wszystko
