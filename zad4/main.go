@@ -21,8 +21,8 @@ const ForecastHorizon = 5                     // prognoza na 5 kroków GridStep
 const PredictorBufferSize = WeatherPerGrid    // bufor = 1 godzin
 const WindMax = 40.0
 const SunMax = 100
-const WINDPOWER = 450.0
-const SUNPOWER = 400.0
+const WINDPOWER = 1350.0
+const SUNPOWER = 1300.0
 const RaportEveryN = 3
 
 type WeatherData struct {
@@ -84,32 +84,48 @@ type Logger struct {
 	logChan chan string
 	file    *os.File
 	writer  *bufio.Writer
+	mu      sync.Mutex // Dodajemy Mutex do ochrony bufio.Writer
 }
 
 func (l *Logger) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
+	defer l.file.Close()
+	defer l.Flush()
+
+	flushTicker := time.NewTicker(GridStep * 24)
+	defer flushTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
-			l.Flush()
-			return
+			l.mu.Lock()
+			for {
+				select {
+				case msg := <-l.logChan:
+					l.writer.WriteString(msg + "\n")
+				default:
+					l.mu.Unlock()
+					return
+				}
+			}
 		case msg := <-l.logChan:
+			l.mu.Lock()
 			l.writer.WriteString(msg + "\n")
+			l.mu.Unlock()
+		case <-flushTicker.C:
+			l.Flush()
 		}
 	}
 }
 
 func (l *Logger) Log(msg string) {
-	select {
-	case l.logChan <- msg:
-	default:
-	}
+	l.logChan <- msg
 }
 
 func (l *Logger) Flush() error {
-	err := l.writer.Flush()
-	l.file.Close()
-	return err
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.writer.Flush()
 }
 
 // ============ Broadcaster ============
@@ -514,6 +530,12 @@ func (ess *ESS) GetSoC() float64 {
 	return ess.current / ess.capacity
 }
 
+func (ess *ESS) GetAvailableEnergy() float64 {
+	ess.mu.Lock()
+	defer ess.mu.Unlock()
+	return ess.current
+}
+
 // ============ GridHub ============
 
 type GridHub struct {
@@ -538,6 +560,8 @@ func (gh *GridHub) Run(ctx context.Context, wg *sync.WaitGroup) {
 	ozeOutput := 0.0
 	coalPlantOutput := 0.0
 
+	gh.logger.Log("hour, ozeOutput, coalPlantOutput, SoC, currentDemand, balance, status")
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -548,9 +572,13 @@ func (gh *GridHub) Run(ctx context.Context, wg *sync.WaitGroup) {
 			for _, dem := range gh.demands {
 				currentDemand += dem.Demand
 			}
-			predictedOutput := forecast.predictedChange + ozeOutput + coalPlantOutput
+			currentOze := gh.oze.GetPower()
+			currentCoal := gh.coalPlant.GetPower()
 
-			if predictedOutput < currentDemand && gh.coalPlant.GetState() == PlantOff {
+			predictedOutput := forecast.predictedChange + currentOze + currentCoal
+			availableBattery := gh.ess.GetAvailableEnergy()
+
+			if predictedOutput+availableBattery < currentDemand && gh.coalPlant.GetState() == PlantOff {
 				fmt.Printf("[GridHub]: Przewidywana produkcja (%.2f MW) nie wystarczy by zaspokoić potrzeby (%.2f MW). Włączanie elektrowni węglowej.\n", predictedOutput, currentDemand)
 				gh.coalPlant.Run(ctx)
 			}
@@ -636,9 +664,6 @@ func (gh *GridHub) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 			gh.logger.Log(fmt.Sprintf("%d, %.1f, %.1f, %.0f, %.2f, %.2f, %s", step%24, ozeOutput, coalPlantOutput, gh.ess.GetSoC()*100, currentDemand, balance, status))
 
-			if step%48 == 0 {
-				gh.logger.Flush()
-			}
 			gh.demands = make(map[string]DemandReport)
 		}
 	}
@@ -675,7 +700,7 @@ func main() {
 	}
 
 	broadcaster := &Broadcaster{subcribers: make([]chan<- WeatherData, 0)}
-	weatherStation := &WeatherStation{windSpeed: 10.0, sun: 70.0}
+	weatherStation := &WeatherStation{windSpeed: 20.0, sun: 80.0}
 	predictor := &WeatherPredictor{buffer: make([]WeatherData, 0)}
 	oze := &OZE{output: 0.0, limit: math.MaxFloat64}
 	coalPlant := &CoalPlant{state: PlantOff, warmingTime: 3, wg: &wg}
