@@ -46,6 +46,16 @@ type SupplyStatus struct {
 	message        string
 }
 
+type CoalPlantStatus struct {
+	State  PlantState
+	Output float64
+}
+
+type CoalPlantComm struct {
+	Type  string
+	Reply chan CoalPlantStatus
+}
+
 // ============ Interfejsy ============
 
 type DataLogger interface {
@@ -306,34 +316,41 @@ type CoalPlant struct {
 	state       PlantState
 	warmingTime int
 	wg          *sync.WaitGroup
+	commChan    <-chan CoalPlantComm
 }
 
-func (cp *CoalPlant) Run(ctx context.Context) {
-	cp.mu.Lock()
-	if cp.state != PlantOff {
-		cp.mu.Unlock()
-		return
-	}
-	fmt.Println("[CoalPlant]: Włączanie elektrowni węglowej...")
-	cp.state = PlantWarmingUp
-	cp.mu.Unlock()
+func (cp *CoalPlant) Run(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	var warmupTimer <-chan time.Time
 
-	cp.wg.Add(1)
-	go func() {
-		defer cp.wg.Done()
+	for {
 		select {
-		case <-time.After(GridStep * time.Duration(cp.warmingTime)):
-			cp.mu.Lock()
-			cp.state = PlantOn
-			cp.output = 200.0
-			cp.mu.Unlock()
-			fmt.Println("[CoalPlant]: Elektrownia węglowa włączona.")
 		case <-ctx.Done():
-			cp.mu.Lock()
-			cp.state = PlantOff
-			cp.mu.Unlock()
+			return
+		case cmd := <-cp.commChan:
+			if cmd.Type == "START" {
+				if cp.state == PlantOff {
+					fmt.Println("[CoalPlant]: Włączanie elektrowni węglowej...")
+					cp.state = PlantWarmingUp
+					warmupTimer = time.After(GridStep * time.Duration(cp.warmingTime))
+				}
+				if cmd.Reply != nil {
+					cmd.Reply <- CoalPlantStatus{State: cp.state, Output: cp.output}
+				}
+			} else if cmd.Type == "STATUS" {
+				if cmd.Reply != nil {
+					cmd.Reply <- CoalPlantStatus{State: cp.state, Output: cp.output}
+				}
+			}
+		case <-warmupTimer:
+			if cp.state == PlantWarmingUp {
+				cp.state = PlantOn
+				cp.output = 200.0
+				fmt.Println("[CoalPlant]: Elektrownia węglowa włączona.")
+			}
+			warmupTimer = nil
 		}
-	}()
+	}
 }
 
 func (cp *CoalPlant) GetPower() float64 {
@@ -546,8 +563,15 @@ type GridHub struct {
 	demandChan   <-chan DemandReport
 	demands      map[string]DemandReport
 	logger       *Logger
+	coalCommChan chan<- CoalPlantComm
 
 	statsMu sync.Mutex
+}
+
+func (gh *GridHub) getCoalStatus() CoalPlantStatus {
+	replyChan := make(chan CoalPlantStatus, 1)
+	gh.coalCommChan <- CoalPlantComm{Type: "STATUS", Reply: replyChan}
+	return <-replyChan
 }
 
 func (gh *GridHub) Run(ctx context.Context, wg *sync.WaitGroup) {
@@ -578,9 +602,10 @@ func (gh *GridHub) Run(ctx context.Context, wg *sync.WaitGroup) {
 			predictedOutput := forecast.predictedChange + currentOze + currentCoal
 			availableBattery := gh.ess.GetAvailableEnergy()
 
-			if predictedOutput+availableBattery < currentDemand && gh.coalPlant.GetState() == PlantOff {
+			if predictedOutput+availableBattery < currentDemand && gh.getCoalStatus().State == PlantOff {
 				fmt.Printf("[GridHub]: Przewidywana produkcja (%.2f MW) nie wystarczy by zaspokoić potrzeby (%.2f MW). Włączanie elektrowni węglowej.\n", predictedOutput, currentDemand)
-				gh.coalPlant.Run(ctx)
+				// gh.coalPlant.Run(ctx, wg)
+				gh.coalCommChan <- CoalPlantComm{Type: "START"}
 			}
 
 		case d := <-gh.demandChan:
