@@ -21,7 +21,7 @@ const PredictorBufferSize = WeatherPerGrid    // bufor = 1 godzin
 const WindMax = 40.0
 const SunMax = 100
 const WINDPOWER = 1350.0
-const SUNPOWER = 1300.0
+const SUNPOWER = 300.0
 const RaportEveryN = 3
 
 type WeatherData struct {
@@ -111,7 +111,8 @@ func (l *Logger) Run(ctx context.Context, wg *sync.WaitGroup) {
 			for {
 				select {
 				case msg := <-l.logChan:
-					l.writer.WriteString(msg + "\n")
+					l.writer.WriteString(msg)
+					l.writer.WriteByte('\n')
 				default:
 					l.mu.Unlock()
 					return
@@ -119,7 +120,8 @@ func (l *Logger) Run(ctx context.Context, wg *sync.WaitGroup) {
 			}
 		case msg := <-l.logChan:
 			l.mu.Lock()
-			l.writer.WriteString(msg + "\n")
+			l.writer.WriteString(msg)
+			l.writer.WriteByte('\n')
 			l.mu.Unlock()
 		case <-flushTicker.C:
 			l.Flush()
@@ -145,7 +147,7 @@ type Broadcaster struct {
 }
 
 func (b *Broadcaster) Subscribe() chan WeatherData {
-	ch := make(chan WeatherData, 8)
+	ch := make(chan WeatherData, int(WeatherPerGrid)*2)
 
 	b.mutex.Lock()
 	b.subcribers = append(b.subcribers, ch)
@@ -330,7 +332,8 @@ func (cp *CoalPlant) Run(ctx context.Context, wg *sync.WaitGroup) {
 		case <-ctx.Done():
 			return
 		case cmd := <-cp.commChan:
-			if cmd.Type == "START" {
+			switch cmd.Type {
+			case "START":
 				if cp.state == PlantOff {
 					fmt.Println("[CoalPlant]: Włączanie elektrowni węglowej...")
 					cp.state = PlantWarmingUp
@@ -339,7 +342,7 @@ func (cp *CoalPlant) Run(ctx context.Context, wg *sync.WaitGroup) {
 				if cmd.Reply != nil {
 					cmd.Reply <- CoalPlantStatus{State: cp.state, Output: cp.output}
 				}
-			} else if cmd.Type == "STATUS" {
+			case "STATUS":
 				if cmd.Reply != nil {
 					cmd.Reply <- CoalPlantStatus{State: cp.state, Output: cp.output}
 				}
@@ -570,7 +573,7 @@ func (gh *GridHub) Run(ctx context.Context, wg *sync.WaitGroup) {
 	ozeOutput := 0.0
 	coalPlantOutput := 0.0
 
-	gh.logger.Log("hour, ozeOutput, coalPlantOutput, SoC, currentDemand, balance, status")
+	gh.logger.Log("hour, ozeOutput, coalPlantOutput, ozeLimit, SoC, currentDemand, balance, status")
 
 	for {
 		select {
