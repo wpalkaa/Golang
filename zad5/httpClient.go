@@ -8,42 +8,46 @@ import (
 	"net/http"
 )
 
-type RequestBody struct {
-	Message string `json:"message"`
+type Item struct {
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
 }
 
-type ResponsePayload struct {
-	Message string `json:"message"`
-	Status  string `json:"status"`
+type CreateItemRequest struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
 }
 
-type customTransport struct {
+type UserAgentTransport struct {
 	UserAgent string
 	Transport http.RoundTripper // silnik HTTP, posiada RoundTrip(*http.Request) (*http.Response, error), przyjmuje żądanie i zwraca odpowiedx
 }
 
 // wykonuje się przed wysłaniem requesta przez klienta do serwera
-func (c *customTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Set("User-Agent", c.UserAgent)
+func (t *UserAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
-	transport := c.Transport
+	transport := t.Transport
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
 
-	return transport.RoundTrip(req)
+	clonedReq := req.Clone(req.Context())
+	clonedReq.Header.Set("User-Agent", t.UserAgent)
+
+	return transport.RoundTrip(clonedReq)
 }
 
 type APIClient struct {
-	BaseURL    string
-	HTTPClient *http.Client
+	baseURL    string
+	httpClient *http.Client
 }
 
 func NewAPIClient(baseURL, userAgent string) *APIClient {
 	return &APIClient{
-		BaseURL: baseURL, // adres API
-		HTTPClient: &http.Client{
-			Transport: &customTransport{
+		baseURL: baseURL, // adres API
+		httpClient: &http.Client{
+			Transport: &UserAgentTransport{
 				UserAgent: userAgent,
 				Transport: http.DefaultTransport,
 			},
@@ -51,46 +55,60 @@ func NewAPIClient(baseURL, userAgent string) *APIClient {
 	}
 }
 
-func (c *APIClient) SendData(ctx context.Context, data RequestBody) (*ResponsePayload, error) {
+// GET Items
+func (c *APIClient) GetItems(ctx context.Context) ([]Item, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/items", nil)
 
-	// -  Kodowaniem i dekodowaniem JSON. (tutaj kodowanie)
-	body, err := json.Marshal(data)
 	if err != nil {
-		return nil, fmt.Errorf("nie udało się zmienić danych na JSON: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// - Żądaniami świadomymi kontekstu.
-	reqURL := fmt.Sprintf("%s/api/resource", c.BaseURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewBuffer(body)) // bufor strumieniowy
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("nie udało się stworzyć requesta: %w", err)
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
+	var items []Item
+	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil { // dekoder strumieniowy, io.ReadAll czyta wszystko
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return items, nil
+}
+
+// POST Item
+func (c *APIClient) CreateItem(ctx context.Context, data CreateItemRequest) (*Item, error) {
+	bodyData, err := json.Marshal(data) // zamienia na json
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert data to json")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/items", bytes.NewReader(bodyData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// wykonanie requesta
-	res, err := c.HTTPClient.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("nie udało się wysłać requesta: %w", err)
+		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
-	defer res.Body.Close()
+	defer resp.Body.Close()
 
-	// - Jawną obsługą statusów.
-	if res.StatusCode == 500 {
-		return nil, fmt.Errorf("server error, 500")
-	}
-	if res.StatusCode == 404 {
-		return nil, fmt.Errorf("not found, 404")
-	}
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, fmt.Errorf("inne kody, %d", res.StatusCode)
+	if resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	//  - Kodowaniem i dekodowaniem JSON (tutaj dekodowanie).
-	var result ResponsePayload
-	if err := json.NewDecoder(res.Body).Decode(&result); err != nil { // dekoder strumieniowy, io.ReadAll czyta wszystko
-		return nil, fmt.Errorf("błąd dekodowania odpowiedzi JSON: %w", err)
+	var createdItem Item
+	if err := json.NewDecoder(resp.Body).Decode(&createdItem); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	return &result, nil
+	return &createdItem, nil
 }

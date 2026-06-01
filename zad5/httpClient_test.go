@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,108 +11,142 @@ import (
 	"time"
 )
 
-func TestAPIClient_SendData_Success(t *testing.T) {
-	expectedUserAgent := "Klient/1.0"
+func TestClient_GetItems(t *testing.T) {
+	expectedUserAgent := "Klient"
 
 	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
 		// czy dobry klient
 		userAgent := req.Header.Get("User-Agent")
 		if userAgent != expectedUserAgent {
-			t.Errorf("Oczekiwano User-Agent %q, otrzymano %q", expectedUserAgent, userAgent)
+			t.Errorf("expected User-Agent %s, got %s", expectedUserAgent, userAgent)
 		}
-
-		// czy dobry header
-		if ct := req.Header.Get("Content-Type"); ct != "application/json" {
-			t.Errorf("Oczekiwano Content-Type 'application/json', otrzymano %q", ct)
+		// Sprawdzenie metody i endpointu
+		if req.Method != http.MethodGet {
+			t.Errorf("expected GET, got %s", req.Method)
+		}
+		if req.URL.Path != "/items" {
+			t.Errorf("expected /items, got %s", req.URL.Path)
 		}
 
 		res.Header().Set("Content-Type", "application/json")
 		res.WriteHeader(http.StatusOK)
-		json.NewEncoder(res).Encode(ResponsePayload{
-			Message: "success",
-			Status:  "ok",
+		json.NewEncoder(res).Encode([]Item{
+			{
+				ID:          1,
+				Name:        "item",
+				Description: "opis itemu",
+			},
+			{
+				ID:          2,
+				Name:        "item 2",
+				Description: "opis itemu 2",
+			},
+		})
+	}))
+	defer server.Close()
+
+	// ============ działania na serwerze przez klienta ============
+
+	client := NewAPIClient(server.URL, expectedUserAgent)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	items, err := client.GetItems(ctx)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if items[0].Name != "item" {
+		t.Errorf("expected name 'item', got %s", items[0].Name)
+	}
+}
+
+func TestClient_CreateItem(t *testing.T) {
+	expectedUserAgent := "Klient"
+	expectedReqBody := `{"name":"New item","description":"new item description"}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", req.Method)
+		}
+		if req.URL.Path != "/items" {
+			t.Errorf("expected /items, got %s", req.URL.Path)
+		}
+		if req.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("expected Content-Type application/json, got %s", req.Header.Get("Content-Type"))
+		}
+
+		bodyBytes, _ := io.ReadAll(req.Body)
+		if string(bodyBytes) != expectedReqBody {
+			t.Errorf("expected body %s, got %s", expectedReqBody, string(bodyBytes))
+		}
+
+		res.Header().Set("Content-Type", "application/json")
+		res.WriteHeader(http.StatusCreated)
+		json.NewEncoder(res).Encode(Item{
+			ID:          3,
+			Name:        "New item",
+			Description: "new item description",
 		})
 	}))
 	defer server.Close()
 
 	// ============ Dzialania na serwerze przez klienta ============
+
 	client := NewAPIClient(server.URL, expectedUserAgent)
-	payload := RequestBody{Message: "wysyłam requeścika"}
+	input := CreateItemRequest{
+		Name:        "New item",
+		Description: "new item description",
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	resp, err := client.SendData(ctx, payload)
-	if err != nil {
-		t.Fatalf("Powinno zwrócić ok, zwrociło błąd: %v", err)
-	}
+	item, err := client.CreateItem(ctx, input)
 
-	if resp.Status != "ok" || resp.Message != "success" {
-		t.Errorf("Nie 'ok' lub 'success': %+v", resp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if item.ID != 3 {
+		t.Errorf("expected ID 3, got %d", item.ID)
 	}
 }
 
-func TestAPIClient_SendData_ServerError(t *testing.T) {
+func TestClient_UnexpectedStatusCode(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		// Błąd serwera
 		res.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
 
-	client := NewAPIClient(server.URL, "Klient/1.0")
+	client := NewAPIClient(server.URL, "Klient")
 
-	ctx := context.Background()
-	_, err := client.SendData(ctx, RequestBody{Message: "Błąd"})
-
+	_, err := client.GetItems(context.Background())
 	if err == nil {
-		t.Fatal("Miał być błąd a ni mo")
-	}
-
-	expectedErr := "server error, 500"
-	if err.Error() != expectedErr {
-		t.Errorf("Oczekiwano błędu %q, otrzymano %q", expectedErr, err.Error())
+		t.Fatal("expected error on 500 status code, got nil")
 	}
 }
 
-func TestAPIClient_SendData_NotFound(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
-		res.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	client := NewAPIClient(server.URL, "Klient/1.0")
-
-	ctx := context.Background()
-	_, err := client.SendData(ctx, RequestBody{Message: "Błąd"})
-
-	if err == nil {
-		t.Fatal("Miał być błąd a ni mo")
-	}
-
-	expectedErr := "not found, 404"
-	if err.Error() != expectedErr {
-		t.Errorf("Oczekiwano błędu %q, otrzymano %q", expectedErr, err.Error())
-	}
-}
-
-func TestSendData_Invalid_JSON_in_response(t *testing.T) {
+func TestClient_Invalid_JSON_in_response(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
 		res.Write([]byte("djaiwd"))
 	}))
 	defer server.Close()
 
-	client := &APIClient{
-		BaseURL:    server.URL,
-		HTTPClient: server.Client(),
-	}
+	client := NewAPIClient(server.URL, "Klient")
 
-	_, err := client.SendData(context.Background(), RequestBody{})
+	_, err := client.GetItems(context.Background())
 
 	if err == nil {
-		t.Fatal("Miał być błąd a ni mo")
+		t.Fatal("expected error, got nil")
 	}
 
-	expectedErr := "błąd dekodowania odpowiedzi JSON"
+	expectedErr := "failed to decode response"
 	if !strings.Contains(err.Error(), expectedErr) {
-		t.Errorf("Oczekiwano błędu %q, otrzymano %q", expectedErr, err.Error())
+		t.Errorf("expected error containing %q, got %q", expectedErr, err.Error())
 	}
 }
