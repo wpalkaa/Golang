@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"math"
 	"math/rand/v2"
 	"os"
 	"os/signal"
@@ -280,6 +279,10 @@ func (o *OZE) GetPower() float64 {
 	return o.output
 }
 
+func (o *OZE) GetLimit() float64 {
+	return o.limit
+}
+
 func (o *OZE) Run(ctx context.Context, wg *sync.WaitGroup, weatherChan <-chan WeatherData) {
 	defer wg.Done()
 
@@ -311,7 +314,6 @@ const (
 )
 
 type CoalPlant struct {
-	mu          sync.Mutex
 	output      float64
 	state       PlantState
 	warmingTime int
@@ -351,21 +353,6 @@ func (cp *CoalPlant) Run(ctx context.Context, wg *sync.WaitGroup) {
 			warmupTimer = nil
 		}
 	}
-}
-
-func (cp *CoalPlant) GetPower() float64 {
-	cp.mu.Lock()
-	defer cp.mu.Unlock()
-	if cp.state == PlantOn {
-		return cp.output
-	}
-	return 0
-}
-
-func (cp *CoalPlant) GetState() PlantState {
-	cp.mu.Lock()
-	defer cp.mu.Unlock()
-	return cp.state
 }
 
 // ============ Konsumenci ============
@@ -557,7 +544,6 @@ func (ess *ESS) GetAvailableEnergy() float64 {
 
 type GridHub struct {
 	oze          *OZE
-	coalPlant    *CoalPlant
 	ess          *ESS
 	forecastChan <-chan ForecastData
 	demandChan   <-chan DemandReport
@@ -597,14 +583,14 @@ func (gh *GridHub) Run(ctx context.Context, wg *sync.WaitGroup) {
 				currentDemand += dem.Demand
 			}
 			currentOze := gh.oze.GetPower()
-			currentCoal := gh.coalPlant.GetPower()
+			coalStatus := gh.getCoalStatus()
+			currentCoal := coalStatus.Output
 
 			predictedOutput := forecast.predictedChange + currentOze + currentCoal
 			availableBattery := gh.ess.GetAvailableEnergy()
 
-			if predictedOutput+availableBattery < currentDemand && gh.getCoalStatus().State == PlantOff {
+			if predictedOutput+availableBattery < currentDemand && coalStatus.State == PlantOff {
 				fmt.Printf("[GridHub]: Przewidywana produkcja (%.2f MW) nie wystarczy by zaspokoić potrzeby (%.2f MW). Włączanie elektrowni węglowej.\n", predictedOutput, currentDemand)
-				// gh.coalPlant.Run(ctx, wg)
 				gh.coalCommChan <- CoalPlantComm{Type: "START"}
 			}
 
@@ -616,7 +602,9 @@ func (gh *GridHub) Run(ctx context.Context, wg *sync.WaitGroup) {
 			status := "STABLE"
 
 			ozeOutput = gh.oze.GetPower()
-			coalPlantOutput = gh.coalPlant.GetPower()
+			coalStatus := gh.getCoalStatus()
+			coalPlantOutput = coalStatus.Output
+			currentLimit := gh.oze.GetLimit()
 
 			currentDemand := 0.0
 			for _, dem := range gh.demands {
@@ -625,18 +613,21 @@ func (gh *GridHub) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 			balance := ozeOutput + coalPlantOutput - currentDemand
 
+			ozeLimit := 99999.9
+
 			if balance >= 0 {
 				unallocated := gh.ess.Charge(balance) // ile zostało
 				if unallocated > 0 {
-					newLimit := ozeOutput - unallocated
-					if newLimit < 0 {
-						newLimit = 0
+					ozeLimit = ozeOutput - unallocated
+					if ozeLimit < 0 {
+						ozeLimit = 0
 					}
 
-					gh.oze.SetLimit(newLimit)
-					fmt.Printf("[GridHub]: Limit OZE: %.1f MW\n", newLimit)
+					gh.oze.SetLimit(ozeLimit)
+					fmt.Printf("[GridHub]: Limit OZE: %.1f MW\n", ozeLimit)
 				} else {
-					gh.oze.SetLimit(math.MaxFloat64)
+					// gh.oze.SetLimit(math.MaxFloat64)
+					gh.oze.SetLimit(99999.0)
 				}
 
 				for _, dem := range gh.demands {
@@ -644,7 +635,8 @@ func (gh *GridHub) Run(ctx context.Context, wg *sync.WaitGroup) {
 				}
 			} else {
 				status = "CRITICAL"
-				gh.oze.SetLimit(math.MaxFloat64)
+				// gh.oze.SetLimit(math.MaxFloat64)
+				gh.oze.SetLimit(ozeLimit)
 
 				fromESS := gh.ess.Discharge(-balance)
 				balance += fromESS
@@ -672,7 +664,6 @@ func (gh *GridHub) Run(ctx context.Context, wg *sync.WaitGroup) {
 							fmt.Printf("[GridHub - LoadShed]: Odłączam %s (priorytet - %d, %1.f MW)\n", req.Id, req.Priority, req.Demand)
 							req.RespChan <- SupplyStatus{AvailablePower: 0, message: "LoadShedding"}
 							deficit -= req.Demand
-							// gh.logger.logChan <- fmt.Sprintf("%d,LOADSHED,%s,%d,%.2f", step%24, req.Id, step, req.Demand)
 						} else {
 							req.RespChan <- SupplyStatus{AvailablePower: req.Demand, message: "ok"}
 						}
@@ -687,7 +678,7 @@ func (gh *GridHub) Run(ctx context.Context, wg *sync.WaitGroup) {
 			}
 			gh.statsMu.Unlock()
 
-			gh.logger.Log(fmt.Sprintf("%d, %.1f, %.1f, %.0f, %.2f, %.2f, %s", step%24, ozeOutput, coalPlantOutput, gh.ess.GetSoC()*100, currentDemand, balance, status))
+			gh.logger.Log(fmt.Sprintf("%d, %.1f, %.1f, %.1f,%.0f, %.2f, %.2f, %s", step%24, ozeOutput, coalPlantOutput, currentLimit, gh.ess.GetSoC()*100, currentDemand, balance, status))
 
 			gh.demands = make(map[string]DemandReport)
 		}
@@ -713,6 +704,7 @@ func main() {
 
 	demandChan := make(chan DemandReport, 50)
 	forecastChan := make(chan ForecastData, 1)
+	coalCommChan := make(chan CoalPlantComm, 10)
 
 	var wg sync.WaitGroup
 
@@ -727,17 +719,19 @@ func main() {
 	broadcaster := &Broadcaster{subcribers: make([]chan<- WeatherData, 0)}
 	weatherStation := &WeatherStation{windSpeed: 20.0, sun: 80.0}
 	predictor := &WeatherPredictor{buffer: make([]WeatherData, 0)}
-	oze := &OZE{output: 0.0, limit: math.MaxFloat64}
-	coalPlant := &CoalPlant{state: PlantOff, warmingTime: 3, wg: &wg}
+	// oze := &OZE{output: 0.0, limit: math.MaxFloat64}
+	oze := &OZE{output: 0.0, limit: 99999.0}
+
+	coalPlant := &CoalPlant{state: PlantOff, warmingTime: 3, wg: &wg, commChan: coalCommChan}
 	ess := &ESS{capacity: 500.0, current: 250.0}
-	// logger
+
 	hub := &GridHub{
 		oze:          oze,
-		coalPlant:    coalPlant,
 		ess:          ess,
 		forecastChan: forecastChan,
 		demandChan:   demandChan,
 		logger:       logger,
+		coalCommChan: coalCommChan,
 	}
 
 	r1 := &ResidentalConsumer{id: "r1", baseDemand: 5.0}
@@ -767,6 +761,9 @@ func main() {
 
 	wg.Add(1)
 	go predictor.Run(ctx, &wg, broadcaster.Subscribe(), forecastChan)
+
+	wg.Add(1)
+	go coalPlant.Run(ctx, &wg)
 
 	wg.Add(1)
 	go hub.Run(ctx, &wg)
