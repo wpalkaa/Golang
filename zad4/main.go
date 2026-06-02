@@ -21,7 +21,7 @@ const PredictorBufferSize = WeatherPerGrid    // bufor = 1 godzin
 const WindMax = 40.0
 const SunMax = 100
 const WINDPOWER = 1350.0
-const SUNPOWER = 300.0
+const SUNPOWER = 1300.0
 const RaportEveryN = 3
 
 type WeatherData struct {
@@ -55,6 +55,23 @@ type CoalPlantComm struct {
 	Reply chan CoalPlantStatus
 }
 
+type OZEStatus struct {
+	Output float64
+	Limit  float64
+}
+
+type OZEComm struct {
+	Type  string // "SET_LIMIT", "STATUS"
+	Limit float64
+	Reply chan OZEStatus
+}
+
+type ESSComm struct {
+	Type  string // "CHARGE", "DISCHARGE", "GET_SOC", "GET_AVAILABLE"
+	Value float64
+	Reply chan float64
+}
+
 // ============ Interfejsy ============
 
 type DataLogger interface {
@@ -68,6 +85,7 @@ type Consumer interface {
 }
 
 type EnergyStorage interface {
+	Run(ctx context.Context, wg *sync.WaitGroup)
 	Charge(value float64) float64
 	Discharge(value float64) float64
 	GetSoC() float64
@@ -84,7 +102,7 @@ type Predictor interface {
 }
 
 type WeatherProvider interface {
-	Run(ctx context.Context, wg *sync.WaitGroup, broadcast *Broadcaster)
+	Run(ctx context.Context, wg *sync.WaitGroup, weatherChan chan<- WeatherData)
 }
 
 // ============ Logger ============
@@ -143,6 +161,7 @@ func (l *Logger) Flush() error {
 
 type Broadcaster struct {
 	subcribers []chan<- WeatherData
+	inputChan  chan WeatherData
 	mutex      sync.Mutex
 }
 
@@ -156,14 +175,21 @@ func (b *Broadcaster) Subscribe() chan WeatherData {
 	return ch
 }
 
-func (b *Broadcaster) Send(data WeatherData) {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-
-	for _, ch := range b.subcribers {
+func (b *Broadcaster) Run(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
 		select {
-		case ch <- data:
-		default:
+		case <-ctx.Done():
+			return
+		case data := <-b.inputChan:
+			b.mutex.Lock()
+			for _, ch := range b.subcribers {
+				select {
+				case ch <- data:
+				default:
+				}
+			}
+			b.mutex.Unlock()
 		}
 	}
 }
@@ -175,7 +201,7 @@ type WeatherStation struct {
 	sun       float64
 }
 
-func (ws *WeatherStation) Run(ctx context.Context, wg *sync.WaitGroup, broadcast *Broadcaster) {
+func (ws *WeatherStation) Run(ctx context.Context, wg *sync.WaitGroup, outChan chan<- WeatherData) {
 	defer wg.Done()
 	ticker := time.NewTicker(WeatherStep)
 	ticker2 := time.NewTicker(GridStep)
@@ -205,7 +231,12 @@ func (ws *WeatherStation) Run(ctx context.Context, wg *sync.WaitGroup, broadcast
 				ws.sun = 100
 			}
 
-			broadcast.Send(WeatherData{WindSpeed: ws.windSpeed, SunIntensity: ws.sun})
+			select {
+			case outChan <- WeatherData{WindSpeed: ws.windSpeed, SunIntensity: ws.sun}:
+			case <-ctx.Done():
+				return
+			}
+
 		case <-ticker2.C:
 			step++
 			if step%RaportEveryN == 0 {
@@ -261,47 +292,60 @@ func (p *WeatherPredictor) Run(ctx context.Context, wg *sync.WaitGroup, weatherD
 // ============ OZE ============
 type OZE struct {
 	output   float64
-	mu       sync.Mutex
 	capacity float64
 	limit    float64
+	commChan chan OZEComm
 }
 
 func (o *OZE) SetLimit(limit float64) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if limit < 0 {
-		limit = 0
-	}
-	o.limit = limit
+	o.commChan <- OZEComm{Type: "SET_LIMIT", Limit: limit}
 }
 
 func (o *OZE) GetPower() float64 {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.output
+	reply := make(chan OZEStatus, 1)
+	o.commChan <- OZEComm{Type: "STATUS", Reply: reply}
+	return (<-reply).Output
 }
 
 func (o *OZE) GetLimit() float64 {
-	return o.limit
+	reply := make(chan OZEStatus, 1)
+	o.commChan <- OZEComm{Type: "STATUS", Reply: reply}
+	return (<-reply).Limit
 }
 
 func (o *OZE) Run(ctx context.Context, wg *sync.WaitGroup, weatherChan <-chan WeatherData) {
 	defer wg.Done()
+	var currentBasePower float64
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case data := <-weatherChan:
-			basePower := ((data.WindSpeed / WindMax) * WINDPOWER) + ((data.SunIntensity / SunMax) * SUNPOWER)
-
-			o.mu.Lock()
-			if basePower > o.limit {
+			currentBasePower = ((data.WindSpeed / WindMax) * WINDPOWER) + ((data.SunIntensity / SunMax) * SUNPOWER)
+			if currentBasePower > o.limit {
 				o.output = o.limit
 			} else {
-				o.output = basePower
+				o.output = currentBasePower
 			}
-			o.mu.Unlock()
+		case req := <-o.commChan:
+			switch req.Type {
+			case "SET_LIMIT":
+				if req.Limit < 0 {
+					o.limit = 0
+				} else {
+					o.limit = req.Limit
+				}
+				if currentBasePower > o.limit {
+					o.output = o.limit
+				} else {
+					o.output = currentBasePower
+				}
+			case "STATUS":
+				if req.Reply != nil {
+					req.Reply <- OZEStatus{Output: o.output, Limit: o.limit}
+				}
+			}
 		}
 	}
 }
@@ -504,43 +548,66 @@ func (r *CriticalConsumer) Run(ctx context.Context, wg *sync.WaitGroup, demandCh
 type ESS struct {
 	capacity float64
 	current  float64
-	mu       sync.Mutex
+	commChan chan ESSComm
+}
+
+func (ess *ESS) Run(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case req := <-ess.commChan:
+			switch req.Type {
+			case "CHARGE":
+				space := ess.capacity - ess.current
+				if req.Value <= space {
+					ess.current += req.Value
+					req.Reply <- 0
+				} else {
+					ess.current = ess.capacity
+					req.Reply <- req.Value - space
+				}
+			case "DISCHARGE":
+				if ess.current >= req.Value {
+					ess.current -= req.Value
+					req.Reply <- req.Value
+				} else {
+					available := ess.current
+					ess.current = 0
+					req.Reply <- available
+				}
+			case "GET_SOC":
+				req.Reply <- ess.current / ess.capacity
+			case "GET_AVAILABLE":
+				req.Reply <- ess.current
+			}
+		}
+	}
 }
 
 func (ess *ESS) Charge(value float64) float64 {
-	ess.mu.Lock()
-	defer ess.mu.Unlock()
-	space := ess.capacity - ess.current
-	if value <= space {
-		ess.current += value
-		return 0
-	}
-	ess.current = ess.capacity
-	return value - space
+	reply := make(chan float64, 1)
+	ess.commChan <- ESSComm{Type: "CHARGE", Value: value, Reply: reply}
+	return <-reply
 }
 
 func (ess *ESS) Discharge(value float64) float64 {
-	ess.mu.Lock()
-	defer ess.mu.Unlock()
-	if ess.current >= value {
-		ess.current -= value
-		return value
-	}
-	available := ess.current
-	ess.current = 0
-	return available
+	reply := make(chan float64, 1)
+	ess.commChan <- ESSComm{Type: "DISCHARGE", Value: value, Reply: reply}
+	return <-reply
 }
 
 func (ess *ESS) GetSoC() float64 {
-	ess.mu.Lock()
-	defer ess.mu.Unlock()
-	return ess.current / ess.capacity
+	reply := make(chan float64, 1)
+	ess.commChan <- ESSComm{Type: "GET_SOC", Reply: reply}
+	return <-reply
 }
 
 func (ess *ESS) GetAvailableEnergy() float64 {
-	ess.mu.Lock()
-	defer ess.mu.Unlock()
-	return ess.current
+	reply := make(chan float64, 1)
+	ess.commChan <- ESSComm{Type: "GET_AVAILABLE", Reply: reply}
+	return <-reply
 }
 
 // ============ GridHub ============
@@ -719,14 +786,18 @@ func main() {
 		file:    logFile,
 	}
 
-	broadcaster := &Broadcaster{subcribers: make([]chan<- WeatherData, 0)}
+	broadcaster := &Broadcaster{
+		subcribers: make([]chan<- WeatherData, 0),
+		inputChan:  make(chan WeatherData, 50),
+	}
+
 	weatherStation := &WeatherStation{windSpeed: 20.0, sun: 80.0}
 	predictor := &WeatherPredictor{buffer: make([]WeatherData, 0)}
-	// oze := &OZE{output: 0.0, limit: math.MaxFloat64}
-	oze := &OZE{output: 0.0, limit: 99999.0}
+
+	oze := &OZE{output: 0.0, limit: 99999.0, commChan: make(chan OZEComm, 10)}
+	ess := &ESS{capacity: 500.0, current: 250.0, commChan: make(chan ESSComm, 10)}
 
 	coalPlant := &CoalPlant{state: PlantOff, warmingTime: 3, wg: &wg, commChan: coalCommChan}
-	ess := &ESS{capacity: 500.0, current: 250.0}
 
 	hub := &GridHub{
 		oze:          oze,
@@ -760,7 +831,13 @@ func main() {
 	go oze.Run(ctx, &wg, broadcaster.Subscribe())
 
 	wg.Add(1)
-	go weatherStation.Run(ctx, &wg, broadcaster)
+	go ess.Run(ctx, &wg)
+
+	wg.Add(1)
+	go broadcaster.Run(ctx, &wg)
+
+	wg.Add(1)
+	go weatherStation.Run(ctx, &wg, broadcaster.inputChan)
 
 	wg.Add(1)
 	go predictor.Run(ctx, &wg, broadcaster.Subscribe(), forecastChan)
